@@ -22,6 +22,45 @@ from app.services import api_keys as api_keys_svc
 from app.state import get_state
 
 router = APIRouter(dependencies=[Depends(rate_limit_default)])
+DASHBOARD_CACHE_TTL_MS = 2000
+
+
+def _dash_cache_key(kind: str, tenant_id: str, *, suffix: str | None = None) -> str:
+    key = f"dash:{kind}:{tenant_id}"
+    if suffix:
+        key = f"{key}:{suffix}"
+    return key
+
+
+def _dash_cache_get(key: str) -> Any:
+    return get_state().l1.get(key)
+
+
+def _dash_cache_set(key: str, value: Any, ttl_ms: int = DASHBOARD_CACHE_TTL_MS) -> Any:
+    get_state().l1.set(key, value, ttl_ms)
+    return value
+
+
+def _invalidate_dashboard_cache(tenant_id: str) -> None:
+    l1 = get_state().l1
+    l1.delete(_dash_cache_key("stats", tenant_id))
+    l1.delete(_dash_cache_key("usage", tenant_id, suffix="days:7"))
+    l1.delete(_dash_cache_key("keys", tenant_id))
+    l1.delete(_dash_cache_key("monitoring", tenant_id))
+    l1.delete(_dash_cache_key("api_keys_list", tenant_id))
+    l1.delete(_dash_cache_key("credentials_list", tenant_id))
+    l1.delete(_dash_cache_key("clients_list", tenant_id))
+    l1.delete(_dash_cache_key("settings", tenant_id))
+    l1.delete(_dash_cache_key("alerts", tenant_id, suffix="status:active|limit:25"))
+    l1.delete(_dash_cache_key("logs", tenant_id, suffix="l:100|p:|k:|s:|q:|f:|t:"))
+
+
+def _invalidate_key_detail_cache(tenant_id: str, key_id: str) -> None:
+    l1 = get_state().l1
+    l1.delete(_dash_cache_key("key_health", tenant_id, suffix=key_id))
+    l1.delete(_dash_cache_key("key_stats", tenant_id, suffix=key_id))
+    l1.delete(_dash_cache_key("key_analytics", tenant_id, suffix=key_id))
+    l1.delete(_dash_cache_key("key_domains", tenant_id, suffix=key_id))
 
 
 @router.get("/api/auth/me")
@@ -73,7 +112,12 @@ async def change_password(request: Request, user: dict = Depends(get_current_use
 
 @router.get("/api/keys")
 async def list_keys(user: dict = Depends(get_current_user)) -> list:
-    return await api_keys_svc.list_api_keys(get_db(), tenant_id=user["id"])
+    cache_key = _dash_cache_key("api_keys_list", user["id"])
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    data = await api_keys_svc.list_api_keys(get_db(), tenant_id=user["id"])
+    return _dash_cache_set(cache_key, data)
 
 
 @router.post("/api/keys")
@@ -94,6 +138,7 @@ async def create_key(request: Request, user: dict = Depends(get_current_user)) -
         user["id"],
         {"type": "api_key.created", "at": int(time.time() * 1000), "tenantId": user["id"], "apiKeyId": created["id"]},
     )
+    _invalidate_dashboard_cache(user["id"])
     return created
 
 
@@ -120,11 +165,18 @@ async def rotate_key(key_id: str, user: dict = Depends(get_current_user)) -> dic
             "newApiKeyId": rotated["id"],
         },
     )
+    _invalidate_dashboard_cache(user["id"])
+    _invalidate_key_detail_cache(user["id"], key_id)
+    _invalidate_key_detail_cache(user["id"], rotated["id"])
     return rotated
 
 
 @router.get("/api/keys/{key_id}/health")
 async def key_health(key_id: str, user: dict = Depends(get_current_user)) -> dict:
+    cache_key = _dash_cache_key("key_health", user["id"], suffix=key_id)
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     db = get_db()
     r = await db.query(
         """select response_time_ms as last_latency_ms,
@@ -137,13 +189,13 @@ async def key_health(key_id: str, user: dict = Depends(get_current_user)) -> dic
         (user["id"], key_id),
     )
     latest = r.rows[0] if r.rows else None
-    return {
+    return _dash_cache_set(cache_key, {
         "id": key_id,
         "last_latency_ms": latest.get("last_latency_ms") if latest else None,
         "last_status": latest.get("last_status") if latest else None,
         "checked_at": latest.get("checked_at") if latest else None,
         "remaining": None,
-    }
+    })
 
 
 @router.patch("/api/keys/{key_id}")
@@ -159,6 +211,8 @@ async def patch_key(key_id: str, request: Request, user: dict = Depends(get_curr
         "select id, tenant_id, status, quota_per_minute, allowed_providers, name, created_at from public.api_keys where id = $1 and tenant_id = $2",
         (key_id, user["id"]),
     )
+    _invalidate_dashboard_cache(user["id"])
+    _invalidate_key_detail_cache(user["id"], key_id)
     return r.rows[0] if r.rows else {}
 
 
@@ -168,11 +222,17 @@ async def delete_key(key_id: str, user: dict = Depends(get_current_user)) -> Res
         "delete from public.api_keys where id = $1 and tenant_id = $2",
         (key_id, user["id"]),
     )
+    _invalidate_dashboard_cache(user["id"])
+    _invalidate_key_detail_cache(user["id"], key_id)
     return Response(status_code=204)
 
 
 @router.get("/api/keys/{key_id}/stats")
 async def key_stats(key_id: str, user: dict = Depends(get_current_user)) -> dict:
+    cache_key = _dash_cache_key("key_stats", user["id"], suffix=key_id)
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     db = get_db()
     o = await db.query("select 1 from public.api_keys where id = $1 and tenant_id = $2", (key_id, user["id"]))
     if not o.rows:
@@ -186,20 +246,29 @@ async def key_stats(key_id: str, user: dict = Depends(get_current_user)) -> dict
         (key_id, days),
     )
     daily = [{"date": row["day"], "requests": row["requests"], "errors": row["errors"]} for row in r.rows]
-    return {"daily": daily}
+    return _dash_cache_set(cache_key, {"daily": daily})
 
 
 @router.get("/api/keys/{key_id}/analytics")
 async def key_analytics(key_id: str, user: dict = Depends(get_current_user)) -> dict:
+    cache_key = _dash_cache_key("key_analytics", user["id"], suffix=key_id)
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     db = get_db()
     o = await db.query("select 1 from public.api_keys where id = $1 and tenant_id = $2", (key_id, user["id"]))
     if not o.rows:
         raise HTTPException(status_code=404, detail="Not found")
-    return await obs.get_api_key_analytics(db, tenant_id=user["id"], api_key_id=key_id)
+    data = await obs.get_api_key_analytics(db, tenant_id=user["id"], api_key_id=key_id)
+    return _dash_cache_set(cache_key, data)
 
 
 @router.get("/api/keys/{key_id}/domains")
 async def key_domains(key_id: str, user: dict = Depends(get_current_user)) -> dict:
+    cache_key = _dash_cache_key("key_domains", user["id"], suffix=key_id)
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     db = get_db()
     o = await db.query("select 1 from public.api_keys where id = $1 and tenant_id = $2", (key_id, user["id"]))
     if not o.rows:
@@ -208,11 +277,15 @@ async def key_domains(key_id: str, user: dict = Depends(get_current_user)) -> di
         "select distinct origin_domain as domain from public.gateway_request_logs where api_key_id = $1 and origin_domain is not null order by 1",
         (key_id,),
     )
-    return {"domains": [row["domain"] for row in r.rows]}
+    return _dash_cache_set(cache_key, {"domains": [row["domain"] for row in r.rows]})
 
 
 @router.get("/api/dashboard/keys")
 async def dashboard_keys(user: dict = Depends(get_current_user)) -> list:
+    cache_key = _dash_cache_key("keys", user["id"])
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     db = get_db()
     keys = await api_keys_svc.list_api_keys(db, tenant_id=user["id"])
     hr = await db.query(
@@ -231,11 +304,15 @@ async def dashboard_keys(user: dict = Depends(get_current_user)) -> list:
     for k in keys:
         h = health_by.get(k["id"])
         out.append({**k, "health": h, "remaining": h.get("remaining") if h else None})
-    return out
+    return _dash_cache_set(cache_key, out)
 
 
 @router.get("/api/stats")
 async def stats(user: dict = Depends(get_current_user)) -> dict:
+    cache_key = _dash_cache_key("stats", user["id"])
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     db = get_db()
     uid = user["id"]
     creds, clients, requests, alerts = await __import__("asyncio").gather(
@@ -257,7 +334,7 @@ async def stats(user: dict = Depends(get_current_user)) -> dict:
     active_credentials = len([x for x in cr if x.get("status") == "active"])
     cooldown_credentials = len([x for x in cr if x.get("status") == "cooldown"])
     total_requests = sum(int(x.get("total_requests") or 0) for x in cr)
-    return {
+    return _dash_cache_set(cache_key, {
         "totalCredentials": total_credentials,
         "activeCredentials": active_credentials,
         "cooldownCredentials": cooldown_credentials,
@@ -265,13 +342,17 @@ async def stats(user: dict = Depends(get_current_user)) -> dict:
         "totalRequests": total_requests,
         "recentErrors": requests.rows[0]["errors"] if requests.rows else 0,
         "activeAlerts": alerts.rows[0]["active"] if alerts.rows else 0,
-    }
+    })
 
 
 @router.get("/api/stats/usage")
 async def stats_usage(user: dict = Depends(get_current_user)) -> dict:
     db = get_db()
     days = 7
+    cache_key = _dash_cache_key("usage", user["id"], suffix=f"days:{days}")
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     r = await db.query(
         """select date_trunc('day', created_at at time zone 'UTC')::date as date,
                   count(*)::int as requests,
@@ -281,12 +362,17 @@ async def stats_usage(user: dict = Depends(get_current_user)) -> dict:
             group by 1 order by 1""",
         (user["id"], days),
     )
-    return {"daily": r.rows}
+    return _dash_cache_set(cache_key, {"daily": r.rows})
 
 
 @router.get("/api/monitoring/overview")
 async def monitoring_overview(user: dict = Depends(get_current_user)) -> dict:
-    return await obs.get_monitoring_overview(get_db(), tenant_id=user["id"])
+    cache_key = _dash_cache_key("monitoring", user["id"])
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    data = await obs.get_monitoring_overview(get_db(), tenant_id=user["id"])
+    return _dash_cache_set(cache_key, data)
 
 
 @router.get("/api/logs")
@@ -300,7 +386,12 @@ async def logs(
     from_: str | None = Query(None, alias="from"),
     to: str | None = Query(None),
 ) -> list:
-    return await obs.list_gateway_logs(
+    cache_suffix = f"l:{int(limit or 100)}|p:{provider or ''}|k:{apiKeyId or ''}|s:{status or ''}|q:{search or ''}|f:{from_ or ''}|t:{to or ''}"
+    cache_key = _dash_cache_key("logs", user["id"], suffix=cache_suffix)
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    data = await obs.list_gateway_logs(
         get_db(),
         tenant_id=user["id"],
         limit=int(limit or 100),
@@ -311,6 +402,7 @@ async def logs(
         date_from=from_,
         date_to=to,
     )
+    return _dash_cache_set(cache_key, data)
 
 
 @router.get("/api/alerts")
@@ -319,9 +411,14 @@ async def alerts(
     status: str = Query("active"),
     limit: int | None = Query(25),
 ) -> list:
-    return await obs.list_gateway_alerts(
+    cache_key = _dash_cache_key("alerts", user["id"], suffix=f"status:{status}|limit:{int(limit or 25)}")
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    data = await obs.list_gateway_alerts(
         get_db(), tenant_id=user["id"], status=status, limit=int(limit or 25)
     )
+    return _dash_cache_set(cache_key, data)
 
 
 @router.patch("/api/alerts/{alert_id}/ack")
@@ -329,17 +426,22 @@ async def ack_alert(alert_id: str, user: dict = Depends(get_current_user)) -> di
     a = await obs.acknowledge_alert(get_db(), tenant_id=user["id"], alert_id=alert_id)
     if not a:
         raise HTTPException(status_code=404, detail="Not found")
+    _invalidate_dashboard_cache(user["id"])
     return a
 
 
 @router.get("/api/credentials")
 async def list_creds(user: dict = Depends(get_current_user)) -> list:
+    cache_key = _dash_cache_key("credentials_list", user["id"])
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     r = await get_db().query(
         """select id, provider_name, provider_type, label, status, total_requests, failed_requests, cooldown_until, created_at
              from public.provider_credentials where user_id = $1 order by created_at desc""",
         (user["id"],),
     )
-    return r.rows
+    return _dash_cache_set(cache_key, r.rows)
 
 
 @router.get("/api/credentials/export")
@@ -387,11 +489,16 @@ async def create_cred(request: Request, user: dict = Depends(get_current_user)) 
             json.dumps(body.get("credentials") or {}),
         ),
     )
+    _invalidate_dashboard_cache(user["id"])
     return r.rows[0]
 
 
 @router.get("/api/credentials/{cred_id}")
 async def get_cred(cred_id: str, user: dict = Depends(get_current_user)) -> dict:
+    cache_key = _dash_cache_key("credential_detail", user["id"], suffix=cred_id)
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     r = await get_db().query(
         """select id, provider_name, provider_type, label, credentials, status, total_requests, failed_requests, cooldown_until, created_at
              from public.provider_credentials where id = $1 and user_id = $2 limit 1""",
@@ -399,7 +506,7 @@ async def get_cred(cred_id: str, user: dict = Depends(get_current_user)) -> dict
     )
     if not r.rows:
         raise HTTPException(status_code=404, detail="Not found")
-    return r.rows[0]
+    return _dash_cache_set(cache_key, r.rows[0])
 
 
 @router.patch("/api/credentials/{cred_id}")
@@ -421,6 +528,8 @@ async def patch_cred(cred_id: str, request: Request, user: dict = Depends(get_cu
              from public.provider_credentials where id = $1 and user_id = $2""",
         (cred_id, user["id"]),
     )
+    _invalidate_dashboard_cache(user["id"])
+    get_state().l1.delete(_dash_cache_key("credential_detail", user["id"], suffix=cred_id))
     return r.rows[0] if r.rows else {}
 
 
@@ -430,6 +539,8 @@ async def delete_cred(cred_id: str, user: dict = Depends(get_current_user)) -> R
         "delete from public.provider_credentials where id = $1 and user_id = $2",
         (cred_id, user["id"]),
     )
+    _invalidate_dashboard_cache(user["id"])
+    get_state().l1.delete(_dash_cache_key("credential_detail", user["id"], suffix=cred_id))
     return Response(status_code=204)
 
 
@@ -439,6 +550,8 @@ async def reactivate_cred(cred_id: str, user: dict = Depends(get_current_user)) 
         "update public.provider_credentials set status = 'active', cooldown_until = null where id = $1 and user_id = $2",
         (cred_id, user["id"]),
     )
+    _invalidate_dashboard_cache(user["id"])
+    get_state().l1.delete(_dash_cache_key("credential_detail", user["id"], suffix=cred_id))
     return Response(status_code=204)
 
 
@@ -463,17 +576,22 @@ async def import_creds(request: Request, user: dict = Depends(get_current_user))
                values ($1, $2, $3, $4, $5)""",
             (user["id"], provider_name, provider_type, label, json.dumps(credentials)),
         )
+    _invalidate_dashboard_cache(user["id"])
     return {"imported": len(items)}
 
 
 @router.get("/api/clients")
 async def list_clients(user: dict = Depends(get_current_user)) -> list:
+    cache_key = _dash_cache_key("clients_list", user["id"])
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     r = await get_db().query(
         """select id, name, api_key, is_active, rate_limit, allowed_providers, created_at
              from public.api_clients where user_id = $1 order by created_at desc""",
         (user["id"],),
     )
-    return r.rows
+    return _dash_cache_set(cache_key, r.rows)
 
 
 @router.post("/api/clients")
@@ -491,6 +609,7 @@ async def create_client(request: Request, user: dict = Depends(get_current_user)
            returning id, name, api_key, is_active, rate_limit, allowed_providers, created_at""",
         (user["id"], name, rate_limit, allowed if allowed else []),
     )
+    _invalidate_dashboard_cache(user["id"])
     return r.rows[0]
 
 
@@ -515,6 +634,7 @@ async def patch_client(client_id: str, request: Request, user: dict = Depends(ge
              from public.api_clients where id = $1 and user_id = $2""",
         (client_id, user["id"]),
     )
+    _invalidate_dashboard_cache(user["id"])
     return r.rows[0] if r.rows else {}
 
 
@@ -524,6 +644,7 @@ async def delete_client(client_id: str, user: dict = Depends(get_current_user)) 
         "delete from public.api_clients where id = $1 and user_id = $2",
         (client_id, user["id"]),
     )
+    _invalidate_dashboard_cache(user["id"])
     return Response(status_code=204)
 
 
@@ -650,6 +771,10 @@ async def pg_upload(
 
 @router.get("/api/settings")
 async def get_settings_u(user: dict = Depends(get_current_user)) -> dict:
+    cache_key = _dash_cache_key("settings", user["id"])
+    cached = _dash_cache_get(cache_key)
+    if cached is not None:
+        return cached
     r = await get_db().query(
         "select setting_key, setting_value from public.system_settings where user_id = $1",
         (user["id"],),
@@ -661,7 +786,7 @@ async def get_settings_u(user: dict = Depends(get_current_user)) -> dict:
             out[row["setting_key"]] = json.loads(raw) if raw else None
         except (json.JSONDecodeError, TypeError):
             out[row["setting_key"]] = raw
-    return out
+    return _dash_cache_set(cache_key, out)
 
 
 @router.put("/api/settings")
@@ -689,6 +814,7 @@ async def put_settings(request: Request, user: dict = Depends(get_current_user))
             out[row["setting_key"]] = json.loads(raw) if raw else None
         except (json.JSONDecodeError, TypeError):
             out[row["setting_key"]] = raw
+    _invalidate_dashboard_cache(user["id"])
     return out
 
 
