@@ -1,4 +1,4 @@
-"""Auth publik: register, login, dev-login."""
+"""Auth publik: register dan login."""
 from __future__ import annotations
 
 import bcrypt
@@ -75,37 +75,3 @@ async def login(request: Request, body: AuthBody) -> dict:
         raise
     except Exception:
         raise HTTPException(status_code=503, detail="Login gagal karena layanan server sedang bermasalah.") from None
-
-
-@router.post("/dev-login", dependencies=[Depends(rate_limit_login_register)])
-async def dev_login(request: Request) -> dict:
-    s = get_settings()
-    if not s.ENABLE_DEV_LOGIN:
-        raise HTTPException(status_code=404, detail="Not found")
-    db = get_db()
-    email = "admin@example.com"
-    password = "password123"
-    try:
-        data = await request.json()
-        if isinstance(data, dict):
-            if data.get("email"):
-                email = str(data["email"]).strip().lower()
-            if data.get("password") is not None:
-                password = str(data["password"])
-    except Exception:
-        pass
-    r = await db.query(
-        "select id, email, display_name, password_hash from public.users where email = $1 limit 1",
-        (email,),
-    )
-    user = r.rows[0] if r.rows else None
-    if not user:
-        raise HTTPException(status_code=404, detail="User tidak ditemukan. Jalankan: npm run seed")
-    if not bcrypt.checkpw(password.encode("utf-8"), str(user["password_hash"]).encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Kredensial tidak valid.")
-    uid = str(user["id"])
-    token = sign_jwt(sub=uid, email=user["email"], display_name=user.get("display_name"))
-    return {
-        "token": token,
-        "user": {"id": uid, "email": user["email"], "displayName": user.get("display_name")},
-    }

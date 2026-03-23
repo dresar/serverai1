@@ -20,7 +20,7 @@ def _sha256_hex(s: str) -> str:
 async def seed_database(db: Database) -> None:
     """
     Data dummy development:
-    - User: admin@example.com (password default: password123 — sama dengan /api/auth/dev-login)
+    - User: admin@example.com (password default: password123)
     - Gateway API key plain: dev_apikey_change_me
     - Credentials: gemini, groq, imagekit (dummy)
     """
@@ -77,7 +77,7 @@ async def seed_database(db: Database) -> None:
     print("Seeding completed successfully!")
     print(f"  Login dashboard: {email} / {password}")
     print(f"  Gateway key (plain): {gateway_key}")
-    print("  dev-login: POST /api/auth/dev-login dengan body kosong (email/password di atas)")
+    print("  Gunakan email/password di atas pada form login frontend.")
 
 
 async def main() -> None:
