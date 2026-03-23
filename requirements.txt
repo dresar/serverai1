@@ -13,3 +13,4 @@ python-multipart>=0.0.12
 prometheus-client>=0.21.0
 cloudinary>=1.41.0
 websockets>=14.0
+a2wsgi>=1.10.10
