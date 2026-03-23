@@ -10,7 +10,7 @@ python -m venv .venv
 .venv\Scripts\activate   # Windows
 # source .venv/bin/activate  # Linux/macOS
 pip install -r requirements.txt
-copy .env.example .env    # isi DATABASE_URL & JWT_SECRET
+# Buat file .env (lihat variabel di bagian bawah); minimal DATABASE_URL & JWT_SECRET
 ```
 
 ## Migrasi & seed
@@ -54,7 +54,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8787 --reload
 
 ## Variabel lingkungan utama
 
-Lihat `.env.example`. Penting: `DATABASE_URL`, `JWT_SECRET`, `CORS_ALLOW_ALL` / `CORS_ORIGINS`, `ENABLE_RUNTIME_MIGRATIONS`, `ENABLE_DEV_LOGIN`, `ENABLE_INTERNAL_TEST_ROUTES`.
+Penting: `DATABASE_URL`, `JWT_SECRET`, `CORS_ALLOW_ALL` / `CORS_ORIGINS`, `ENABLE_RUNTIME_MIGRATIONS`, `ENABLE_DEV_LOGIN`, `ENABLE_INTERNAL_TEST_ROUTES`, `NODE_ENV` / `MODE`.
+
+## Deploy di Vercel (Python / FastAPI)
+
+- **Install Command:** biarkan default Vercel (`pip install -r requirements.txt`) atau isi eksplisit: `pip install -r requirements.txt`
+- **Build Command:** kosongkan (tidak wajib untuk backend Python ini; Vercel memasang dependency lalu menjalankan app). Hanya isi jika nanti ada skrip build kustom.
+- **Root Directory:** `server` jika repo monorepo.
+- Salin isi `.env` production ke **Environment Variables** di project Vercel; untuk serverless tambahkan `VERCEL=1`, `RUNTIME=serverless`, dan `ENABLE_RUNTIME_MIGRATIONS=false` (migrasi DB jalankan manual/CI).
 
 ## Opsi performa
 
